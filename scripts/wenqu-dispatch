@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Bounded, capability-based failover for Wenqu expert roles."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+
+
+ROUTES = {
+    "赵选题": ["codex", "claude", "codebuddy"],
+    "李文章": ["codex", "claude", "codebuddy"],
+    "张素材": ["agy", "claude", "codex"],
+    "周审稿": ["claude", "codex", "codebuddy"],
+    "刘风格": ["codex", "claude", "codebuddy"],
+    "无查查": ["claude", "codex", "codebuddy"],
+    "陈排版": ["codex", "codebuddy", "claude"],
+    "王整理": ["codex", "codebuddy", "claude"],
+    "陈开发": ["trae", "qoder", "claude"],
+    "齐工程": ["qoder", "claude", "codex"],
+    "码管线": ["codebuddy", "qoder", "claude"],
+}
+
+COMMANDS = {
+    "codex": ["codex", "exec", "--skip-git-repo-check"],
+    "claude": ["claude", "-p"],
+    "agy": ["agy", "-p"],
+    "codebuddy": ["codebuddy", "-p"],
+    "trae": ["trae-cli", "run"],
+    "qoder": ["qodercli", "-p", "--model", "auto", "--permission-mode", "auto"],
+}
+
+FAILURE_MARKERS = (
+    "not signed in", "login required", "authentication", "unauthorized",
+    "insufficient balance", "quota", "rate limit", "connection refused",
+    "network is unreachable", "timed out", "cannot open /dev/tty",
+)
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="问渠专家团有限故障转移调度器")
+    p.add_argument("role", nargs="?", choices=sorted(ROUTES))
+    p.add_argument("--task")
+    p.add_argument("--workdir", default=os.getcwd())
+    p.add_argument("--expect-file")
+    p.add_argument("--timeout", type=int, default=600)
+    p.add_argument("--no-failover", action="store_true")
+    p.add_argument("--matrix", action="store_true")
+    return p
+
+
+def command_for(agent: str, task: str) -> list[str]:
+    override = os.getenv(f"WENQU_CMD_{agent.upper()}")
+    if override:
+        return [override, task]
+    return [*COMMANDS[agent], task]
+
+
+def classify(text: str, returncode: int) -> str:
+    lowered = text.lower()
+    for marker in FAILURE_MARKERS:
+        if marker in lowered:
+            return marker
+    return "nonzero_exit" if returncode else "invalid_output"
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if args.matrix:
+        for role, agents in ROUTES.items():
+            print(f"{role}: {' -> '.join(agents)}")
+        return 0
+    if not args.role or not args.task:
+        parser().error("执行时必须同时提供角色和 --task")
+
+    workdir = pathlib.Path(args.workdir).expanduser().resolve()
+    if not workdir.is_dir():
+        print(f"工作目录不存在: {workdir}", file=sys.stderr)
+        return 2
+    expected = pathlib.Path(args.expect_file).expanduser().resolve() if args.expect_file else None
+    agents = ROUTES[args.role][:1] if args.no_failover else ROUTES[args.role]
+    run_dir = workdir / ".wenqu-runs"
+    run_dir.mkdir(exist_ok=True)
+    run_id = dt.datetime.now().strftime("%Y%m%dT%H%M%S%f")
+    attempts: list[dict[str, object]] = []
+
+    handoff = (
+        f"你正在替补执行问渠专家团的 @{args.role} 席位。\n"
+        "保持原任务范围和权限；不要发布、部署、push、删除用户数据，"
+        "不要写入 Decision OS 判断资产。完成本棒后停止。\n"
+        f"工作目录：{workdir}\n原任务：{args.task}"
+    )
+
+    for agent in agents:
+        binary = COMMANDS[agent][0]
+        override = os.getenv(f"WENQU_CMD_{agent.upper()}")
+        if not override and shutil.which(binary) is None:
+            attempts.append({"agent": agent, "ok": False, "failure": "missing_cli"})
+            continue
+        try:
+            result = subprocess.run(
+                command_for(agent, handoff), cwd=workdir, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=args.timeout, check=False,
+            )
+            combined = (result.stdout + "\n" + result.stderr).strip()
+            output_ok = bool(result.stdout.strip())
+            file_ok = expected is None or (expected.is_file() and expected.stat().st_size > 0)
+            marker_hit = any(marker in combined.lower() for marker in FAILURE_MARKERS)
+            ok = result.returncode == 0 and output_ok and file_ok and not marker_hit
+            log_file = run_dir / f"{run_id}-{agent}.log"
+            log_file.write_text(combined + "\n", encoding="utf-8")
+            attempts.append({
+                "agent": agent, "ok": ok, "returncode": result.returncode,
+                "failure": None if ok else classify(combined, result.returncode),
+                "log": str(log_file),
+            })
+            if ok:
+                print(result.stdout.rstrip())
+                print(f"\n[问渠调度] 实际执行者={agent}；证据={log_file}", file=sys.stderr)
+                return 0
+        except subprocess.TimeoutExpired as exc:
+            log_file = run_dir / f"{run_id}-{agent}.log"
+            log_file.write_text(f"timeout after {args.timeout}s\n{exc}\n", encoding="utf-8")
+            attempts.append({"agent": agent, "ok": False, "failure": "timeout", "log": str(log_file)})
+
+    report = run_dir / f"{run_id}-failure.json"
+    report.write_text(json.dumps({"role": args.role, "task": args.task, "attempts": attempts}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"全部预设执行者不可用；已停止。证据={report}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
